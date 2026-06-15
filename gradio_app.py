@@ -21,8 +21,12 @@ from tiling import tiled_predict
 CONFIG = "configs/full_lora_config.yaml"
 WEIGHTS = "weights/medsam3_v1/best_lora_weights.pt"
 
-# Povinná minimální velikost vstupu (delší strana). Pod tím model nemá co analyzovat.
-MIN_SIDE = 600
+# --- pravidla pro vstupní snímek (best practices) ---
+TILE = 1008            # nativní vstup SAM3
+MIN_SIDE = 600         # pod tím nemá model dost detailů -> odmítnout
+MAX_SIDE = 4000        # nad tím zmenšíme, aby výpočet (dlaždice na CPU) nebyl extrémní
+TILE_TRIGGER = 1300    # automaticky dlaždicovat, když delší strana přesáhne tuto hodnotu
+MAX_MEGAPIXELS = 40    # tvrdý strop (ochrana paměti)
 
 # ---- knihovny promptů (český popisek -> anglický prompt, model rozumí anglicky) ----
 GENERAL_PROMPTS = {
@@ -61,40 +65,68 @@ ENGINE = SAM3LoRAInference(config_path=CONFIG, weights_path=WEIGHTS,
 print("✅ Model připraven.", flush=True)
 
 
-def analyze(image, prompts, threshold, nms, show_boxes, upscale, use_tiling):
+def validate_image(image):
+    """Validátor vstupu. Vrací (pripraveny_obrazek | None, chyba, poznamka)."""
     if image is None:
-        return None, "⚠️ Nejprve nahrajte snímek."
-    if not prompts:
-        return None, "⚠️ Vyberte alespoň jeden cíl (nebo zadejte vlastní)."
+        return None, "⚠️ Nejprve nahrajte snímek.", ""
+    try:
+        img = image.convert("RGB")
+    except Exception:
+        return None, "⚠️ Soubor nelze načíst jako obrázek.", ""
 
-    img = image.convert("RGB")
     W, H = img.size
+    if min(W, H) < 16:
+        return None, "⚠️ Snímek má neplatné rozměry.", ""
     if max(W, H) < MIN_SIDE:
         return None, (f"⚠️ Snímek je příliš malý ({W}×{H} px). "
                       f"Minimální delší strana je **{MIN_SIDE} px** — nahrajte snímek "
-                      f"ve vyšším rozlišení (model jinak nemá dostatek detailů).")
+                      f"ve vyšším rozlišení (zvětšování zde nepomáhá, model jinak "
+                      f"nemá dostatek skutečných detailů)."), ""
+    if (W * H) / 1e6 > MAX_MEGAPIXELS or max(W, H) > MAX_SIDE:
+        s = min(MAX_SIDE / max(W, H), (MAX_MEGAPIXELS * 1e6 / (W * H)) ** 0.5)
+        img = img.resize((max(1, int(W * s)), max(1, int(H * s))), Image.LANCZOS)
+        return img, "", f"snímek zmenšen na {img.size[0]}×{img.size[1]} px (limit výkonu)"
+
+    ratio = max(W, H) / min(W, H)
+    note = "⚠️ velmi protáhlý poměr stran" if ratio > 6 else ""
+    return img, "", note
+
+
+def analyze(image, prompts, threshold, nms, show_boxes, mode):
+    img, err, info = validate_image(image)
+    if err:
+        return None, err
+    if not prompts:
+        return None, "⚠️ Vyberte alespoň jeden cíl (nebo zadejte vlastní)."
+
+    W, H = img.size
+    if mode.startswith("Jeden"):
+        use_tiling = False
+    elif mode.startswith("Vždy"):
+        use_tiling = True
+    else:  # Automaticky – best practice: dlaždice jen u velkých snímků
+        use_tiling = max(W, H) > TILE_TRIGGER
 
     ENGINE.detection_threshold = float(threshold)
     ENGINE.nms_iou_threshold = float(nms)
 
-    note = ""
-    if upscale and float(upscale) > 1.0:
-        img = img.resize((int(W * upscale), int(H * upscale)), Image.LANCZOS)
-        note += f" · zvětšeno {upscale:g}× → {img.size[0]}×{img.size[1]}"
-
     t0 = time.time()
     if use_tiling:
-        results = tiled_predict(ENGINE, img, prompts)
-        note += " · dlaždice"
+        results = tiled_predict(ENGINE, img, prompts, tile=TILE, overlap=0.25)
+        how = "dlaždice"
     else:
         tmp_in = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
         img.save(tmp_in)
         results = ENGINE.predict(tmp_in, prompts)
+        how = "jeden průchod"
     tmp_out = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
     ENGINE.visualize(results, tmp_out, show_boxes=show_boxes, show_masks=True)
     dt = time.time() - t0
 
-    lines = [f"### Výsledky  (⏱️ {dt:.0f} s{note})", ""]
+    meta = f"{how} · {W}×{H} px"
+    if info:
+        meta += f" · {info}"
+    lines = [f"### Výsledky  (⏱️ {dt:.0f} s · {meta})", ""]
     total = 0
     for idx in sorted([k for k in results if k != "_image"]):
         r = results[idx]
@@ -108,20 +140,19 @@ def analyze(image, prompts, threshold, nms, show_boxes, upscale, use_tiling):
     return Image.open(tmp_out), "\n".join(lines)
 
 
-def _controls(default_tiling, default_upscale):
-    """Sdílené ovládací prvky (vrací slovník komponent)."""
+def _controls():
+    """Sdílené ovládací prvky."""
+    mode = gr.Radio(
+        ["Automaticky (doporučeno)", "Vždy dlaždice", "Jeden průchod"],
+        value="Automaticky (doporučeno)",
+        label="Režim zpracování (dlaždice = přesnější u velkých snímků, pomalejší)")
     with gr.Accordion("Pokročilé nastavení", open=False):
         threshold = gr.Slider(0.1, 0.9, value=0.4, step=0.05,
                               label="Práh jistoty (nižší = více nálezů)")
         nms = gr.Slider(0.1, 0.9, value=0.5, step=0.05,
                         label="NMS IoU (nižší = méně překryvů)")
-        upscale = gr.Slider(1.0, 3.0, value=default_upscale, step=0.5,
-                            label="Zvětšení snímku (zoom; pomáhá u malých struktur, zpomaluje)")
         show_boxes = gr.Checkbox(value=True, label="Zobrazit ohraničení (rámečky)")
-    use_tiling = gr.Checkbox(
-        value=default_tiling,
-        label="🔬 Režim velkého snímku (dlaždice) – přesnější, ale výrazně pomalejší")
-    return threshold, nms, upscale, show_boxes, use_tiling
+    return threshold, nms, show_boxes, mode
 
 
 CAPABILITIES_MD = """
@@ -158,12 +189,13 @@ využít MedSAM3 i pro obecné lékařské snímky.
 - **PLA / jádra / buňky**: detekce funguje *zero-shot* (jistota 0,9+)
 - **Optimalizace velkých snímků – dlaždice**: na testovacím PLA snímku
   tečky 13 → 43, jádra 31 → 68, buňky 25 → 49 (a vyšší jistota)
-- Zjištěno: SAM3 je pevně vázán na vstup **1008×1008** → řešením je dlaždicování,
-  ne prosté zvětšování
+- **Validátor vstupu** + automatické rozhodnutí o dlaždicování podle velikosti
+- Zjištěno: SAM3 je pevně vázán na vstup **1008×1008**; prosté **zvětšování
+  snímku nepomáhá** (interpolace nepřidá detail) → odstraněno, řešením je dlaždicování
 
 ### 🔄 Probíhá
 - **Prompt engineering** — profesionálnější formulace, více variant pro TNT (testujeme)
-- Ladění velikosti dlaždic / zvětšení
+- Ladění velikosti dlaždic / překryvu
 
 ### ⏭️ Plánováno
 - **Počítání PLA teček na jednu buňku** (přiřazení teček k ROI jádra)
@@ -201,17 +233,17 @@ with gr.Blocks(title="MedSAM3") as demo:
                                              value=["Nádor / léze (tumor)"], label="Co hledat")
                     g_custom = gr.Textbox(label="Vlastní cíl(e) anglicky, oddělené čárkou",
                                           placeholder="např. spleen, pancreas")
-                    g_thr, g_nms, g_up, g_box, g_tile = _controls(False, 1.0)
+                    g_thr, g_nms, g_box, g_mode = _controls()
                     g_btn = gr.Button("▶ Spustit analýzu", variant="primary")
                 with gr.Column():
                     g_out = gr.Image(label="Výsledek", type="pil")
                     g_txt = gr.Markdown()
             g_btn.click(
-                lambda im, sel, cu, t, n, b, u, tl: analyze(
+                lambda im, sel, cu, t, n, b, m: analyze(
                     im, [GENERAL_PROMPTS[s] for s in (sel or [])]
                     + [p.strip() for p in (cu or "").split(",") if p.strip()],
-                    t, n, b, u, tl),
-                [g_img, g_sel, g_custom, g_thr, g_nms, g_box, g_up, g_tile], [g_out, g_txt])
+                    t, n, b, m),
+                [g_img, g_sel, g_custom, g_thr, g_nms, g_box, g_mode], [g_out, g_txt])
 
         # ---- 3) Výzkum: TNT / PLA / buňky ----
         with gr.Tab("🧫 Výzkum: TNT · PLA · buňky"):
@@ -231,18 +263,18 @@ with gr.Blocks(title="MedSAM3") as demo:
                                              label="TNT — varianty promptu (testovací)")
                     r_custom = gr.Textbox(label="Vlastní cíl(e) anglicky, oddělené čárkou",
                                           placeholder="např. mitochondria")
-                    r_thr, r_nms, r_up, r_box, r_tile = _controls(True, 1.5)
+                    r_thr, r_nms, r_box, r_mode = _controls()
                     r_btn = gr.Button("▶ Spustit analýzu", variant="primary")
                 with gr.Column():
                     r_out = gr.Image(label="Výsledek", type="pil")
                     r_txt = gr.Markdown()
             r_btn.click(
-                lambda im, sel, tnt, cu, t, n, b, u, tl: analyze(
+                lambda im, sel, tnt, cu, t, n, b, m: analyze(
                     im, [RESEARCH_PROMPTS[s] for s in (sel or [])]
                     + [TNT_VARIANTS[x] for x in (tnt or [])]
                     + [p.strip() for p in (cu or "").split(",") if p.strip()],
-                    t, n, b, u, tl),
-                [r_img, r_sel, r_tnt, r_custom, r_thr, r_nms, r_box, r_up, r_tile],
+                    t, n, b, m),
+                [r_img, r_sel, r_tnt, r_custom, r_thr, r_nms, r_box, r_mode],
                 [r_out, r_txt])
 
         # ---- 4) Stav projektu ----
