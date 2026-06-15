@@ -50,15 +50,16 @@ PLA_PROMPTS = {
     "Buňka – ROI (cell)": "cell",
 }
 
-# více variant pro TNT — testujeme a učíme se, která formulace funguje nejlépe
+# varianty promptu pro TNT, seřazené podle bake-off testu (nejlepší první);
+# "tunneling nanotube" doslova funguje nejhůř, popisné formulace lépe
 TNT_VARIANTS = {
-    "tunneling nanotube": "tunneling nanotube",
-    "thin tube connecting cells": "thin tube connecting cells",
     "membrane bridge between cells": "membrane bridge between cells",
-    "intercellular bridge": "intercellular bridge",
     "thin membrane protrusion": "thin membrane protrusion",
     "filament between cells": "filament between cells",
+    "thin tube connecting cells": "thin tube connecting cells",
     "actin filament": "actin filament",
+    "intercellular bridge": "intercellular bridge",
+    "tunneling nanotube": "tunneling nanotube",
 }
 
 print("⏳ Načítám model (jednorázově)…", flush=True)
@@ -228,10 +229,13 @@ využít MedSAM3 i pro obecné lékařské snímky.
   (práh / přímost / kanál); měří délku, kterou SAM3 neumí
 - Zjištěno: SAM3 je pevně vázán na vstup **1008×1008**; prosté **zvětšování
   snímku nepomáhá** (interpolace nepřidá detail) → odstraněno, řešením je dlaždicování
+- **TNT prompt bake-off**: popisné formulace („membrane bridge between cells“ 0,63;
+  „thin membrane protrusion“ 0,57) překonaly doslovné „tunneling nanotube“ (0,51)
+  → nastaveny jako výchozí
 
 ### 🔄 Probíhá
-- **Prompt engineering** — profesionálnější formulace, více variant pro TNT (testujeme)
 - Ladění velikosti dlaždic / překryvu
+- **Zjištěno: žádná veřejná anotovaná TNT data** → pro dotrénování nutná vlastní anotace
 
 ### ⏭️ Plánováno
 - **TNT**: dotrénování (LoRA) na anotovaných snímcích — TNT není ve slovníku v1
@@ -323,15 +327,17 @@ with gr.Blocks(title="MedSAM3") as demo:
             gr.Markdown(
                 "**Tunneling nanotubes.** Cíl: detekovat a měřit tenké trubice mezi "
                 "buňkami. ⚠️ **Nejtěžší úloha** — TNT není ve slovníku modelu v1, takže "
-                "*zero-shot* je slabý. Zde **testujeme více formulací promptu** (vyberte "
-                "několik a porovnejte). Skutečné zlepšení přinese **dotrénování** "
-                "(viz záložka Stav projektu).")
+                "*zero-shot* je slabý. Z testu vyplynulo, že **popisné formulace** "
+                "(„membrane bridge between cells“, „thin membrane protrusion“) fungují lépe "
+                "než doslovné „tunneling nanotube“ — proto jsou předvybrané. Skutečné "
+                "zlepšení přinese **dotrénování** (viz záložka Stav projektu).")
             with gr.Row():
                 with gr.Column():
                     t_img = gr.Image(type="pil", label="Vstupní snímek")
                     t_tnt = gr.CheckboxGroup(
-                        list(TNT_VARIANTS.keys()), value=["tunneling nanotube"],
-                        label="Varianty promptu pro TNT (testovací — vyberte více a porovnejte)")
+                        list(TNT_VARIANTS.keys()),
+                        value=["membrane bridge between cells", "thin membrane protrusion"],
+                        label="Varianty promptu pro TNT (řazeno dle testu; vyberte více a porovnejte)")
                     t_ctx = gr.Checkbox(value=True, label="Vyznačit i buňky pro kontext (cell)")
                     t_custom = gr.Textbox(label="Vlastní cíl(e) anglicky, oddělené čárkou",
                                           placeholder="např. nanotube")
