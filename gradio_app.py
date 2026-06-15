@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-MedSAM3 – jednoduché webové rozhraní (Gradio) pro detekci a segmentaci
-v mikroskopických snímcích. Model běží na tomto serveru (AWS), rozhraní
-pouze posílá vstupy a zobrazuje výstupy.
+MedSAM3 — webové rozhraní (Gradio). Model běží na AWS serveru; rozhraní
+posílá vstupy a zobrazuje výstupy.
 
-Spuštění:  python3 gradio_app.py   (viz deploy/run_frontend.sh)
+Záložky:
+  • Co umí           – přehled schopností technologie
+  • Obecná medicína  – běžné radiologické / klinické případy
+  • Výzkum (TNT/PLA) – cíl projektu: TNT, PLA tečky, buňky
+  • Stav projektu    – vývojový log
 """
-import os
 import time
 import tempfile
 
@@ -19,131 +21,237 @@ from tiling import tiled_predict
 CONFIG = "configs/full_lora_config.yaml"
 WEIGHTS = "weights/medsam3_v1/best_lora_weights.pt"
 
-# Český popisek -> anglický prompt (model rozumí angličtině)
-PROMPT_MAP = {
-    "Jádro buňky (nucleus)": "nucleus",
-    "Buňka (cell)": "cell",
-    "Fluorescenční tečka – PLA (fluorescent spot)": "fluorescent spot",
-    "Tunelující nanotrubice – TNT (tunneling nanotube)": "tunneling nanotube",
-    "Membránový výběžek (cell membrane protrusion)": "cell membrane protrusion",
+# Povinná minimální velikost vstupu (delší strana). Pod tím model nemá co analyzovat.
+MIN_SIDE = 600
+
+# ---- knihovny promptů (český popisek -> anglický prompt, model rozumí anglicky) ----
+GENERAL_PROMPTS = {
+    "Plíce – RTG (lung)": "lung",
+    "Plicní uzel (lung nodule)": "lung nodule",
+    "Zlomenina kosti (bone fracture)": "bone fracture",
+    "Nádor / léze (tumor)": "tumor",
+    "Játra – CT (liver)": "liver",
+    "Ledvina (kidney)": "kidney",
+    "Kožní léze – dermatoskopie (skin lesion)": "skin lesion",
+    "Polyp – endoskopie (polyp)": "polyp",
+    "Buněčné jádro – histologie (cell nucleus)": "cell nucleus",
 }
 
-print("⏳ Načítám model (jednorázově, může trvat ~1 min)…")
-ENGINE = SAM3LoRAInference(
-    config_path=CONFIG,
-    weights_path=WEIGHTS,
-    detection_threshold=0.4,
-    nms_iou_threshold=0.5,
-)
-print("✅ Model připraven.")
+RESEARCH_PROMPTS = {
+    "Jádro buňky (nucleus)": "nucleus",
+    "Buňka (cell)": "cell",
+    "PLA tečka (fluorescent spot)": "fluorescent spot",
+    "PLA puncta (fluorescent puncta)": "fluorescent puncta",
+}
+
+# více variant pro TNT — testujeme a učíme se, která formulace funguje nejlépe
+TNT_VARIANTS = {
+    "tunneling nanotube": "tunneling nanotube",
+    "thin tube connecting cells": "thin tube connecting cells",
+    "membrane bridge between cells": "membrane bridge between cells",
+    "intercellular bridge": "intercellular bridge",
+    "thin membrane protrusion": "thin membrane protrusion",
+    "filament between cells": "filament between cells",
+    "actin filament": "actin filament",
+}
+
+print("⏳ Načítám model (jednorázově)…", flush=True)
+ENGINE = SAM3LoRAInference(config_path=CONFIG, weights_path=WEIGHTS,
+                           detection_threshold=0.4, nms_iou_threshold=0.5)
+print("✅ Model připraven.", flush=True)
 
 
-def run(image, cz_prompts, custom_prompt, threshold, nms, show_boxes, use_tiling):
+def analyze(image, prompts, threshold, nms, show_boxes, upscale, use_tiling):
     if image is None:
-        return None, "⚠️ Nejprve nahrajte obrázek."
-
-    prompts = [PROMPT_MAP[p] for p in (cz_prompts or [])]
-    if custom_prompt and custom_prompt.strip():
-        prompts.append(custom_prompt.strip())
+        return None, "⚠️ Nejprve nahrajte snímek."
     if not prompts:
-        return None, "⚠️ Vyberte alespoň jeden cíl, nebo zadejte vlastní (anglicky)."
+        return None, "⚠️ Vyberte alespoň jeden cíl (nebo zadejte vlastní)."
+
+    img = image.convert("RGB")
+    W, H = img.size
+    if max(W, H) < MIN_SIDE:
+        return None, (f"⚠️ Snímek je příliš malý ({W}×{H} px). "
+                      f"Minimální delší strana je **{MIN_SIDE} px** — nahrajte snímek "
+                      f"ve vyšším rozlišení (model jinak nemá dostatek detailů).")
 
     ENGINE.detection_threshold = float(threshold)
     ENGINE.nms_iou_threshold = float(nms)
 
+    note = ""
+    if upscale and float(upscale) > 1.0:
+        img = img.resize((int(W * upscale), int(H * upscale)), Image.LANCZOS)
+        note += f" · zvětšeno {upscale:g}× → {img.size[0]}×{img.size[1]}"
+
     t0 = time.time()
     if use_tiling:
-        # split the image into overlapping 1008 crops -> better on large images
-        results = tiled_predict(ENGINE, image.convert("RGB"), prompts)
+        results = tiled_predict(ENGINE, img, prompts)
+        note += " · dlaždice"
     else:
         tmp_in = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
-        image.convert("RGB").save(tmp_in)
+        img.save(tmp_in)
         results = ENGINE.predict(tmp_in, prompts)
     tmp_out = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
     ENGINE.visualize(results, tmp_out, show_boxes=show_boxes, show_masks=True)
     dt = time.time() - t0
 
-    lines = [f"### Výsledky  (⏱️ {dt:.0f} s)", ""]
+    lines = [f"### Výsledky  (⏱️ {dt:.0f} s{note})", ""]
     total = 0
     for idx in sorted([k for k in results if k != "_image"]):
         r = results[idx]
         n = r["num_detections"]
         total += n
         if n:
-            lines.append(f"- **{r['prompt']}**: {n} nálezů  ·  max. jistota {r['scores'].max():.2f}")
+            lines.append(f"- **{r['prompt']}**: {n}  ·  max. jistota {float(r['scores'].max()):.2f}")
         else:
-            lines.append(f"- **{r['prompt']}**: 0 nálezů")
-    lines.append("")
-    lines.append(f"**Celkem nalezeno: {total}**")
+            lines.append(f"- _{r['prompt']}_: 0")
+    lines += ["", f"**Celkem nalezeno: {total}**"]
     return Image.open(tmp_out), "\n".join(lines)
 
 
-# příklady ze složky s testovacími snímky
-def _examples():
-    ex = []
-    for sub in ("pla", "tnt"):
-        d = os.path.join("test_images", sub)
-        if os.path.isdir(d):
-            for f in sorted(os.listdir(d)):
-                if f.lower().endswith((".png", ".jpg", ".jpeg")):
-                    ex.append([os.path.join(d, f)])
-    return ex
+def _controls(default_tiling, default_upscale):
+    """Sdílené ovládací prvky (vrací slovník komponent)."""
+    with gr.Accordion("Pokročilé nastavení", open=False):
+        threshold = gr.Slider(0.1, 0.9, value=0.4, step=0.05,
+                              label="Práh jistoty (nižší = více nálezů)")
+        nms = gr.Slider(0.1, 0.9, value=0.5, step=0.05,
+                        label="NMS IoU (nižší = méně překryvů)")
+        upscale = gr.Slider(1.0, 3.0, value=default_upscale, step=0.5,
+                            label="Zvětšení snímku (zoom; pomáhá u malých struktur, zpomaluje)")
+        show_boxes = gr.Checkbox(value=True, label="Zobrazit ohraničení (rámečky)")
+    use_tiling = gr.Checkbox(
+        value=default_tiling,
+        label="🔬 Režim velkého snímku (dlaždice) – přesnější, ale výrazně pomalejší")
+    return threshold, nms, upscale, show_boxes, use_tiling
 
 
-with gr.Blocks(title="MedSAM3 – mikroskopie") as demo:
-    gr.Markdown(
-        """
-        # 🔬 MedSAM3 — detekce a segmentace v mikroskopii
-        Nástroj automaticky **najde a vyznačí** struktury v mikroskopickém snímku
-        podle zadaného cíle. Cílem projektu je automatizace detekce **TNT
-        (tunelujících nanotrubic)** a počítání **PLA teček** s vymezením oblastí (ROI).
+CAPABILITIES_MD = """
+# 🧠 MedSAM3 — segmentace obrazu pomocí lékařských pojmů
 
-        **Jak to použít:** 1) nahrajte snímek (nebo vyberte příklad níže) · 2) zvolte
-        cíle · 3) klikněte na **Spustit analýzu**.
-        > ⚙️ Model běží na CPU serveru, jeden výpočet trvá přibližně **1–2 minuty**.
-        """
-    )
-    with gr.Row():
-        with gr.Column(scale=1):
-            inp = gr.Image(type="pil", label="Vstupní snímek")
-            cz_prompts = gr.CheckboxGroup(
-                choices=list(PROMPT_MAP.keys()),
-                value=["Jádro buňky (nucleus)", "Buňka (cell)"],
-                label="Co hledat",
-            )
-            custom_prompt = gr.Textbox(
-                label="Vlastní cíl (anglicky, nepovinné)",
-                placeholder="např. mitochondria",
-            )
-            with gr.Accordion("Pokročilé nastavení", open=False):
-                threshold = gr.Slider(0.1, 0.9, value=0.4, step=0.05,
-                                      label="Práh jistoty (nižší = více nálezů)")
-                nms = gr.Slider(0.1, 0.9, value=0.5, step=0.05,
-                                label="NMS IoU (nižší = méně překryvů)")
-                show_boxes = gr.Checkbox(value=True, label="Zobrazit ohraničení (rámečky)")
-            use_tiling = gr.Checkbox(
-                value=False,
-                label="🔬 Režim velkého snímku (dlaždice) – přesnější u velkých snímků, ale výrazně pomalejší",
-            )
-            btn = gr.Button("▶ Spustit analýzu", variant="primary")
-        with gr.Column(scale=1):
-            out_img = gr.Image(label="Výsledek", type="pil")
-            out_txt = gr.Markdown()
+**Co to umí:** místo ručního klikání nebo kreslení rámečků prostě **slovem popíšete,
+co hledat**, a model to v obraze **najde, vyznačí (maska) a spočítá**.
 
-    gr.Examples(examples=_examples(), inputs=inp, label="Příklady (PLA a TNT)")
+### Podporované modality
+🩻 RTG · 🧠 CT / MRI / PET · 🔊 ultrazvuk · 🔬 mikroskopie & histopatologie ·
+🩹 dermatoskopie · 🫁 endoskopie · 🧫 fluorescenční mikroskopie (buňky)
 
-    btn.click(run, [inp, cz_prompts, custom_prompt, threshold, nms, show_boxes, use_tiling],
-              [out_img, out_txt])
+### K čemu je to dobré
+- **Detekce & segmentace** orgánů, lézí, nádorů, buněk…
+- **Počítání** objektů (např. PLA teček, jader, buněk)
+- **Definice oblastí zájmu (ROI)** pro následné měření
+- **Bez anotací** — řízeno textem (tzv. *concept-guided*)
 
-    gr.Markdown(
-        "<small>MedSAM3 (SAM3 + LoRA) · zdrojové snímky CC-BY/PD viz "
-        "<code>test_images/SOURCES.md</code> · model běží na AWS, data se nikam neukládají.</small>"
-    )
+> Postaveno na **Meta SAM3** + jemné doladění **LoRA** pro lékařské pojmy (MedSAM3).
+> Vyberte si nahoře záložku **Obecná medicína** nebo **Výzkum (TNT / PLA / buňky)**.
+"""
+
+STATUS_MD = """
+# 📋 Stav projektu / vývojový log
+
+**Cíl projektu:** automatizovat **detekci a měření tunelujících nanotrubic (TNT)**
+a **počítání PLA teček s definicí ROI** ve fluorescenční mikroskopii — a u toho
+využít MedSAM3 i pro obecné lékařské snímky.
+
+### ✅ Hotovo
+- Fork repozitáře, nasazení na **AWS** (CPU instance, eu-central-1)
+- Zprovoznění **SAM3 + MedSAM3 LoRA** (CPU patche pro CUDA-only kód)
+- České **webové rozhraní** (toto) jako trvalá služba (systemd)
+- **PLA / jádra / buňky**: detekce funguje *zero-shot* (jistota 0,9+)
+- **Optimalizace velkých snímků – dlaždice**: na testovacím PLA snímku
+  tečky 13 → 43, jádra 31 → 68, buňky 25 → 49 (a vyšší jistota)
+- Zjištěno: SAM3 je pevně vázán na vstup **1008×1008** → řešením je dlaždicování,
+  ne prosté zvětšování
+
+### 🔄 Probíhá
+- **Prompt engineering** — profesionálnější formulace, více variant pro TNT (testujeme)
+- Ladění velikosti dlaždic / zvětšení
+
+### ⏭️ Plánováno
+- **Počítání PLA teček na jednu buňku** (přiřazení teček k ROI jádra)
+- **TNT**: dotrénování (LoRA) na anotovaných snímcích — TNT není ve slovníku v1
+- **GPU** instance (po navýšení kvóty) → ~20× rychlejší
+- Stabilní (Elastic IP) odkaz pro sdílení
+
+_Poslední aktualizace: 2026-06-15._
+"""
+
+TECH_MD = (
+    "<hr><small><b>Tech stack:</b> Meta <b>SAM3</b> + <b>MedSAM3</b> LoRA · "
+    "PyTorch 2.7 · Hugging Face · Gradio · běží na <b>AWS EC2</b> (eu-central-1) · "
+    "Python/systemd. Model běží na serveru, nahrané snímky se neukládají. "
+    "Zdroj: github.com/Boza-Analytics/MedSAM3</small>"
+)
+
+
+with gr.Blocks(title="MedSAM3") as demo:
+    gr.Markdown("## 🔬 MedSAM3 — analýza lékařských a mikroskopických snímků")
+
+    with gr.Tabs():
+        # ---- 1) Co umí ----
+        with gr.Tab("ℹ️ Co umí"):
+            gr.Markdown(CAPABILITIES_MD)
+
+        # ---- 2) Obecná medicína ----
+        with gr.Tab("🩻 Obecná medicína"):
+            gr.Markdown("Běžné případy: RTG, CT/MRI, dermatoskopie, endoskopie, histologie. "
+                        "Vyberte cíl, nahrajte snímek a spusťte analýzu.")
+            with gr.Row():
+                with gr.Column():
+                    g_img = gr.Image(type="pil", label="Vstupní snímek")
+                    g_sel = gr.CheckboxGroup(list(GENERAL_PROMPTS.keys()),
+                                             value=["Nádor / léze (tumor)"], label="Co hledat")
+                    g_custom = gr.Textbox(label="Vlastní cíl(e) anglicky, oddělené čárkou",
+                                          placeholder="např. spleen, pancreas")
+                    g_thr, g_nms, g_up, g_box, g_tile = _controls(False, 1.0)
+                    g_btn = gr.Button("▶ Spustit analýzu", variant="primary")
+                with gr.Column():
+                    g_out = gr.Image(label="Výsledek", type="pil")
+                    g_txt = gr.Markdown()
+            g_btn.click(
+                lambda im, sel, cu, t, n, b, u, tl: analyze(
+                    im, [GENERAL_PROMPTS[s] for s in (sel or [])]
+                    + [p.strip() for p in (cu or "").split(",") if p.strip()],
+                    t, n, b, u, tl),
+                [g_img, g_sel, g_custom, g_thr, g_nms, g_box, g_up, g_tile], [g_out, g_txt])
+
+        # ---- 3) Výzkum: TNT / PLA / buňky ----
+        with gr.Tab("🧫 Výzkum: TNT · PLA · buňky"):
+            gr.Markdown(
+                "**Cíl projektu:** automatizovat detekci a měření **TNT (tunelujících "
+                "nanotrubic)** a počítání **PLA teček** s definicí ROI ve fluorescenční "
+                "mikroskopii. U TNT zkoušíme více formulací promptu — vyberte několik a "
+                "porovnejte, která nejlépe nachází tenké trubice.")
+            with gr.Row():
+                with gr.Column():
+                    r_img = gr.Image(type="pil", label="Vstupní snímek")
+                    r_sel = gr.CheckboxGroup(list(RESEARCH_PROMPTS.keys()),
+                                             value=["Jádro buňky (nucleus)", "Buňka (cell)"],
+                                             label="Buňky / PLA")
+                    r_tnt = gr.CheckboxGroup(list(TNT_VARIANTS.keys()),
+                                             value=["tunneling nanotube"],
+                                             label="TNT — varianty promptu (testovací)")
+                    r_custom = gr.Textbox(label="Vlastní cíl(e) anglicky, oddělené čárkou",
+                                          placeholder="např. mitochondria")
+                    r_thr, r_nms, r_up, r_box, r_tile = _controls(True, 1.5)
+                    r_btn = gr.Button("▶ Spustit analýzu", variant="primary")
+                with gr.Column():
+                    r_out = gr.Image(label="Výsledek", type="pil")
+                    r_txt = gr.Markdown()
+            r_btn.click(
+                lambda im, sel, tnt, cu, t, n, b, u, tl: analyze(
+                    im, [RESEARCH_PROMPTS[s] for s in (sel or [])]
+                    + [TNT_VARIANTS[x] for x in (tnt or [])]
+                    + [p.strip() for p in (cu or "").split(",") if p.strip()],
+                    t, n, b, u, tl),
+                [r_img, r_sel, r_tnt, r_custom, r_thr, r_nms, r_box, r_up, r_tile],
+                [r_out, r_txt])
+
+        # ---- 4) Stav projektu ----
+        with gr.Tab("📋 Stav projektu"):
+            gr.Markdown(STATUS_MD)
+
+    gr.Markdown(TECH_MD)
+
 
 if __name__ == "__main__":
-    demo.queue(max_size=8).launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False,  # accessed directly via http://<EC2_IP>:7860 (port opened in SG)
-        show_error=True,
-    )
+    demo.queue(max_size=8).launch(server_name="0.0.0.0", server_port=7860,
+                                  share=False, show_error=True)
