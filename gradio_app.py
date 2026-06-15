@@ -14,6 +14,7 @@ from PIL import Image
 import gradio as gr
 
 from infer_sam import SAM3LoRAInference
+from tiling import tiled_predict
 
 CONFIG = "configs/full_lora_config.yaml"
 WEIGHTS = "weights/medsam3_v1/best_lora_weights.pt"
@@ -37,7 +38,7 @@ ENGINE = SAM3LoRAInference(
 print("✅ Model připraven.")
 
 
-def run(image, cz_prompts, custom_prompt, threshold, nms, show_boxes):
+def run(image, cz_prompts, custom_prompt, threshold, nms, show_boxes, use_tiling):
     if image is None:
         return None, "⚠️ Nejprve nahrajte obrázek."
 
@@ -47,14 +48,17 @@ def run(image, cz_prompts, custom_prompt, threshold, nms, show_boxes):
     if not prompts:
         return None, "⚠️ Vyberte alespoň jeden cíl, nebo zadejte vlastní (anglicky)."
 
-    tmp_in = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
-    image.convert("RGB").save(tmp_in)
-
     ENGINE.detection_threshold = float(threshold)
     ENGINE.nms_iou_threshold = float(nms)
 
     t0 = time.time()
-    results = ENGINE.predict(tmp_in, prompts)
+    if use_tiling:
+        # split the image into overlapping 1008 crops -> better on large images
+        results = tiled_predict(ENGINE, image.convert("RGB"), prompts)
+    else:
+        tmp_in = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
+        image.convert("RGB").save(tmp_in)
+        results = ENGINE.predict(tmp_in, prompts)
     tmp_out = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
     ENGINE.visualize(results, tmp_out, show_boxes=show_boxes, show_masks=True)
     dt = time.time() - t0
@@ -117,6 +121,10 @@ with gr.Blocks(title="MedSAM3 – mikroskopie") as demo:
                 nms = gr.Slider(0.1, 0.9, value=0.5, step=0.05,
                                 label="NMS IoU (nižší = méně překryvů)")
                 show_boxes = gr.Checkbox(value=True, label="Zobrazit ohraničení (rámečky)")
+            use_tiling = gr.Checkbox(
+                value=False,
+                label="🔬 Režim velkého snímku (dlaždice) – přesnější u velkých snímků, ale výrazně pomalejší",
+            )
             btn = gr.Button("▶ Spustit analýzu", variant="primary")
         with gr.Column(scale=1):
             out_img = gr.Image(label="Výsledek", type="pil")
@@ -124,7 +132,7 @@ with gr.Blocks(title="MedSAM3 – mikroskopie") as demo:
 
     gr.Examples(examples=_examples(), inputs=inp, label="Příklady (PLA a TNT)")
 
-    btn.click(run, [inp, cz_prompts, custom_prompt, threshold, nms, show_boxes],
+    btn.click(run, [inp, cz_prompts, custom_prompt, threshold, nms, show_boxes, use_tiling],
               [out_img, out_txt])
 
     gr.Markdown(
