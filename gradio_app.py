@@ -17,6 +17,7 @@ import gradio as gr
 
 from infer_sam import SAM3LoRAInference
 from tiling import tiled_predict
+from pla_count import pla_quantify
 
 CONFIG = "configs/full_lora_config.yaml"
 WEIGHTS = "weights/medsam3_v1/best_lora_weights.pt"
@@ -140,6 +141,26 @@ def analyze(image, prompts, threshold, nms, show_boxes, mode):
     return Image.open(tmp_out), "\n".join(lines)
 
 
+ROI_MAP = {"Jádro (nucleus)": "nucleus", "Buňka (cell)": "cell"}
+
+
+def count_pla(image, roi_label, spot_label, threshold, nms, mode):
+    img, err, _ = validate_image(image)
+    if err:
+        return None, err
+    W, H = img.size
+    if mode.startswith("Jeden"):
+        use_tiling = False
+    elif mode.startswith("Vždy"):
+        use_tiling = True
+    else:
+        use_tiling = max(W, H) > TILE_TRIGGER
+    ENGINE.detection_threshold = float(threshold)
+    ENGINE.nms_iou_threshold = float(nms)
+    return pla_quantify(ENGINE, img, PLA_PROMPTS.get(spot_label, "fluorescent spot"),
+                        ROI_MAP.get(roi_label, "nucleus"), use_tiling)
+
+
 def _controls():
     """Sdílené ovládací prvky."""
     mode = gr.Radio(
@@ -190,6 +211,8 @@ využít MedSAM3 i pro obecné lékařské snímky.
 - **Optimalizace velkých snímků – dlaždice**: na testovacím PLA snímku
   tečky 13 → 43, jádra 31 → 68, buňky 25 → 49 (a vyšší jistota)
 - **Validátor vstupu** + automatické rozhodnutí o dlaždicování podle velikosti
+- **Počítání PLA teček na ROI** (tečka → nejbližší jádro/buňka, tabulka na buňku)
+- **Oddělené záložky PLA a TNT** (různé úlohy)
 - Zjištěno: SAM3 je pevně vázán na vstup **1008×1008**; prosté **zvětšování
   snímku nepomáhá** (interpolace nepřidá detail) → odstraněno, řešením je dlaždicování
 
@@ -198,8 +221,8 @@ využít MedSAM3 i pro obecné lékařské snímky.
 - Ladění velikosti dlaždic / překryvu
 
 ### ⏭️ Plánováno
-- **Počítání PLA teček na jednu buňku** (přiřazení teček k ROI jádra)
 - **TNT**: dotrénování (LoRA) na anotovaných snímcích — TNT není ve slovníku v1
+  (GPU kvóta schválena; čeká se na anotovaná data)
 - **GPU** instance (po navýšení kvóty) → ~20× rychlejší
 - Stabilní (Elastic IP) odkaz pro sdílení
 
@@ -263,6 +286,13 @@ with gr.Blocks(title="MedSAM3") as demo:
                                           placeholder="např. mitochondria")
                     p_thr, p_nms, p_box, p_mode = _controls()
                     p_btn = gr.Button("▶ Spustit analýzu", variant="primary")
+                    gr.Markdown("— nebo —  **kvantifikace: spočítat tečky na ROI**")
+                    p_roi = gr.Dropdown(list(ROI_MAP.keys()), value="Jádro (nucleus)",
+                                        label="ROI (oblast pro přiřazení teček)")
+                    p_spot = gr.Dropdown(
+                        ["PLA tečka (fluorescent spot)", "PLA puncta (fluorescent puncta)"],
+                        value="PLA tečka (fluorescent spot)", label="Typ tečky")
+                    p_count_btn = gr.Button("🔢 Spočítat tečky na ROI", variant="secondary")
                 with gr.Column():
                     p_out = gr.Image(label="Výsledek", type="pil")
                     p_txt = gr.Markdown()
@@ -272,6 +302,8 @@ with gr.Blocks(title="MedSAM3") as demo:
                     + [p.strip() for p in (cu or "").split(",") if p.strip()],
                     t, n, b, m),
                 [p_img, p_sel, p_custom, p_thr, p_nms, p_box, p_mode], [p_out, p_txt])
+            p_count_btn.click(count_pla,
+                              [p_img, p_roi, p_spot, p_thr, p_nms, p_mode], [p_out, p_txt])
 
         # ---- 4) TNT ----
         with gr.Tab("🧵 TNT — tunelující nanotrubice"):
