@@ -18,6 +18,7 @@ import gradio as gr
 from infer_sam import SAM3LoRAInference
 from tiling import tiled_predict
 from pla_count import pla_quantify
+from tnt_measure import measure_tnt
 
 CONFIG = "configs/full_lora_config.yaml"
 WEIGHTS = "weights/medsam3_v1/best_lora_weights.pt"
@@ -161,6 +162,16 @@ def count_pla(image, roi_label, spot_label, threshold, nms, mode):
                         ROI_MAP.get(roi_label, "nucleus"), use_tiling)
 
 
+def run_tnt_measure(image, channel, threshold, min_len, straight, px):
+    img, err, _ = validate_image(image)
+    if err:
+        return None, err
+    return measure_tnt(img, channel=channel, threshold=float(threshold),
+                       min_len_px=int(min_len),
+                       pixel_size_um=(float(px) if px and float(px) > 0 else None),
+                       straightness=float(straight))
+
+
 def _controls():
     """Sdílené ovládací prvky."""
     mode = gr.Radio(
@@ -213,6 +224,8 @@ využít MedSAM3 i pro obecné lékařské snímky.
 - **Validátor vstupu** + automatické rozhodnutí o dlaždicování podle velikosti
 - **Počítání PLA teček na ROI** (tečka → nejbližší jádro/buňka, tabulka na buňku)
 - **Oddělené záložky PLA a TNT** (různé úlohy)
+- **TNT: detekce + měření délky filtrem trubic (Frangi)** — asistivní, laditelné
+  (práh / přímost / kanál); měří délku, kterou SAM3 neumí
 - Zjištěno: SAM3 je pevně vázán na vstup **1008×1008**; prosté **zvětšování
   snímku nepomáhá** (interpolace nepřidá detail) → odstraněno, řešením je dlaždicování
 
@@ -323,7 +336,22 @@ with gr.Blocks(title="MedSAM3") as demo:
                     t_custom = gr.Textbox(label="Vlastní cíl(e) anglicky, oddělené čárkou",
                                           placeholder="např. nanotube")
                     t_thr, t_nms, t_box, t_mode = _controls()
-                    t_btn = gr.Button("▶ Spustit analýzu", variant="primary")
+                    t_btn = gr.Button("▶ Detekce modelem (SAM3)", variant="primary")
+                    gr.Markdown(
+                        "— nebo —  **detekce + měření délky filtrem trubic** (bez modelu, "
+                        "rychlé). Vhodné pro snímky s izolovanými TNT nad tmavým pozadím; "
+                        "u hustého aktinu nadhodnocuje — laďte prahem a přímostí.")
+                    tm_ch = gr.Dropdown(
+                        ["Automaticky (max)", "Červený (actin/membrána)", "Zelený",
+                         "Modrý (jádra)", "Šedá"], value="Automaticky (max)", label="Kanál")
+                    tm_thr = gr.Slider(0.05, 0.40, value=0.15, step=0.01,
+                                       label="Práh citlivosti (vyšší = méně nálezů)")
+                    tm_min = gr.Slider(10, 200, value=30, step=5, label="Min. délka (px)")
+                    tm_str = gr.Slider(0.3, 0.9, value=0.6, step=0.05,
+                                       label="Přímost (vyšší = jen rovné trubice)")
+                    tm_px = gr.Number(value=None, label="Velikost pixelu (µm/px, nepovinné)")
+                    tm_btn = gr.Button("🔬 Detekce + měření TNT (filtr trubic)",
+                                       variant="secondary")
                 with gr.Column():
                     t_out = gr.Image(label="Výsledek", type="pil")
                     t_txt = gr.Markdown()
@@ -334,6 +362,8 @@ with gr.Blocks(title="MedSAM3") as demo:
                     + [p.strip() for p in (cu or "").split(",") if p.strip()],
                     t, n, b, m),
                 [t_img, t_tnt, t_ctx, t_custom, t_thr, t_nms, t_box, t_mode], [t_out, t_txt])
+            tm_btn.click(run_tnt_measure,
+                         [t_img, tm_ch, tm_thr, tm_min, tm_str, tm_px], [t_out, t_txt])
 
         # ---- 5) Stav projektu ----
         with gr.Tab("📋 Stav projektu"):
