@@ -41,11 +41,11 @@ GENERAL_PROMPTS = {
     "Buněčné jádro – histologie (cell nucleus)": "cell nucleus",
 }
 
-RESEARCH_PROMPTS = {
-    "Jádro buňky (nucleus)": "nucleus",
-    "Buňka (cell)": "cell",
+PLA_PROMPTS = {
     "PLA tečka (fluorescent spot)": "fluorescent spot",
     "PLA puncta (fluorescent puncta)": "fluorescent puncta",
+    "Jádro buňky – ROI (nucleus)": "nucleus",
+    "Buňka – ROI (cell)": "cell",
 }
 
 # více variant pro TNT — testujeme a učíme se, která formulace funguje nejlépe
@@ -172,7 +172,7 @@ co hledat**, a model to v obraze **najde, vyznačí (maska) a spočítá**.
 - **Bez anotací** — řízeno textem (tzv. *concept-guided*)
 
 > Postaveno na **Meta SAM3** + jemné doladění **LoRA** pro lékařské pojmy (MedSAM3).
-> Vyberte si nahoře záložku **Obecná medicína** nebo **Výzkum (TNT / PLA / buňky)**.
+> Vyberte si nahoře záložku **Obecná medicína**, **PLA** nebo **TNT**.
 """
 
 STATUS_MD = """
@@ -245,39 +245,65 @@ with gr.Blocks(title="MedSAM3") as demo:
                     t, n, b, m),
                 [g_img, g_sel, g_custom, g_thr, g_nms, g_box, g_mode], [g_out, g_txt])
 
-        # ---- 3) Výzkum: TNT / PLA / buňky ----
-        with gr.Tab("🧫 Výzkum: TNT · PLA · buňky"):
+        # ---- 3) PLA ----
+        with gr.Tab("🟢 PLA — počítání teček + ROI"):
             gr.Markdown(
-                "**Cíl projektu:** automatizovat detekci a měření **TNT (tunelujících "
-                "nanotrubic)** a počítání **PLA teček** s definicí ROI ve fluorescenční "
-                "mikroskopii. U TNT zkoušíme více formulací promptu — vyberte několik a "
-                "porovnejte, která nejlépe nachází tenké trubice.")
+                "**Proximity Ligation Assay.** Cíl: spočítat **PLA tečky** (každá = "
+                "interakce proteinů) a vymezit **oblasti zájmu (ROI)** — jádra/buňky. "
+                "Funguje dobře i bez dotrénování. U velkých snímků doporučujeme dlaždice "
+                "(automaticky).")
             with gr.Row():
                 with gr.Column():
-                    r_img = gr.Image(type="pil", label="Vstupní snímek")
-                    r_sel = gr.CheckboxGroup(list(RESEARCH_PROMPTS.keys()),
-                                             value=["Jádro buňky (nucleus)", "Buňka (cell)"],
-                                             label="Buňky / PLA")
-                    r_tnt = gr.CheckboxGroup(list(TNT_VARIANTS.keys()),
-                                             value=["tunneling nanotube"],
-                                             label="TNT — varianty promptu (testovací)")
-                    r_custom = gr.Textbox(label="Vlastní cíl(e) anglicky, oddělené čárkou",
+                    p_img = gr.Image(type="pil", label="Vstupní snímek (fluorescenční)")
+                    p_sel = gr.CheckboxGroup(
+                        list(PLA_PROMPTS.keys()),
+                        value=["PLA tečka (fluorescent spot)", "Jádro buňky – ROI (nucleus)"],
+                        label="Co hledat")
+                    p_custom = gr.Textbox(label="Vlastní cíl(e) anglicky, oddělené čárkou",
                                           placeholder="např. mitochondria")
-                    r_thr, r_nms, r_box, r_mode = _controls()
-                    r_btn = gr.Button("▶ Spustit analýzu", variant="primary")
+                    p_thr, p_nms, p_box, p_mode = _controls()
+                    p_btn = gr.Button("▶ Spustit analýzu", variant="primary")
                 with gr.Column():
-                    r_out = gr.Image(label="Výsledek", type="pil")
-                    r_txt = gr.Markdown()
-            r_btn.click(
-                lambda im, sel, tnt, cu, t, n, b, m: analyze(
-                    im, [RESEARCH_PROMPTS[s] for s in (sel or [])]
-                    + [TNT_VARIANTS[x] for x in (tnt or [])]
+                    p_out = gr.Image(label="Výsledek", type="pil")
+                    p_txt = gr.Markdown()
+            p_btn.click(
+                lambda im, sel, cu, t, n, b, m: analyze(
+                    im, [PLA_PROMPTS[s] for s in (sel or [])]
                     + [p.strip() for p in (cu or "").split(",") if p.strip()],
                     t, n, b, m),
-                [r_img, r_sel, r_tnt, r_custom, r_thr, r_nms, r_box, r_mode],
-                [r_out, r_txt])
+                [p_img, p_sel, p_custom, p_thr, p_nms, p_box, p_mode], [p_out, p_txt])
 
-        # ---- 4) Stav projektu ----
+        # ---- 4) TNT ----
+        with gr.Tab("🧵 TNT — tunelující nanotrubice"):
+            gr.Markdown(
+                "**Tunneling nanotubes.** Cíl: detekovat a měřit tenké trubice mezi "
+                "buňkami. ⚠️ **Nejtěžší úloha** — TNT není ve slovníku modelu v1, takže "
+                "*zero-shot* je slabý. Zde **testujeme více formulací promptu** (vyberte "
+                "několik a porovnejte). Skutečné zlepšení přinese **dotrénování** "
+                "(viz záložka Stav projektu).")
+            with gr.Row():
+                with gr.Column():
+                    t_img = gr.Image(type="pil", label="Vstupní snímek")
+                    t_tnt = gr.CheckboxGroup(
+                        list(TNT_VARIANTS.keys()), value=["tunneling nanotube"],
+                        label="Varianty promptu pro TNT (testovací — vyberte více a porovnejte)")
+                    t_ctx = gr.Checkbox(value=True, label="Vyznačit i buňky pro kontext (cell)")
+                    t_custom = gr.Textbox(label="Vlastní cíl(e) anglicky, oddělené čárkou",
+                                          placeholder="např. nanotube")
+                    t_thr, t_nms, t_box, t_mode = _controls()
+                    t_btn = gr.Button("▶ Spustit analýzu", variant="primary")
+                with gr.Column():
+                    t_out = gr.Image(label="Výsledek", type="pil")
+                    t_txt = gr.Markdown()
+            t_btn.click(
+                lambda im, tnt, ctx, cu, t, n, b, m: analyze(
+                    im, [TNT_VARIANTS[x] for x in (tnt or [])]
+                    + (["cell"] if ctx else [])
+                    + [p.strip() for p in (cu or "").split(",") if p.strip()],
+                    t, n, b, m),
+                [t_img, t_tnt, t_ctx, t_custom, t_thr, t_nms, t_box, t_mode], [t_out, t_txt])
+
+        # ---- 5) Stav projektu ----
         with gr.Tab("📋 Stav projektu"):
             gr.Markdown(STATUS_MD)
 
