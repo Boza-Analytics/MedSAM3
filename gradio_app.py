@@ -86,7 +86,7 @@ def _examples():
     return ex
 
 
-with gr.Blocks(title="MedSAM3 – mikroskopie", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="MedSAM3 – mikroskopie") as demo:
     gr.Markdown(
         """
         # 🔬 MedSAM3 — detekce a segmentace v mikroskopii
@@ -136,5 +136,6 @@ if __name__ == "__main__":
     demo.queue(max_size=8).launch(
         server_name="0.0.0.0",
         server_port=7860,
-        share=True,
+        share=False,  # accessed directly via http://<EC2_IP>:7860 (port opened in SG)
+        show_error=True,
     )

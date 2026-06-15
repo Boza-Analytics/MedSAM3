@@ -1,0 +1,13 @@
+[Unit]
+Description=MedSAM3 Gradio frontend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /home/ubuntu/start_fe.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
